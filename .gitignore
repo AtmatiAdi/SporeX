@@ -6,3 +6,6 @@ obj/
 *.tmp
 *.png
 !docs/*.png
+build/
+tools/setup/target/
+.tools/

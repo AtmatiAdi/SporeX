@@ -1,0 +1,103 @@
+# Wydanie SporeX: tag vX.Y.Z -> eksport gry (Godot) + instalator (Rust)
+# -> sumy -> GitHub Release w tym repozytorium. Tag tworzy release.ps1.
+name: release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag do wydania, np. v0.2.0'
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+          fetch-depth: 0
+
+      - name: Wersja z tagu
+        id: ver
+        shell: pwsh
+        run: |
+          $tag = '${{ inputs.tag || github.ref_name }}'
+          if ($tag -notmatch '^v\d+\.\d+\.\d+$') { throw "tag `"$tag`" nie jest vX.Y.Z" }
+          $version = $tag.Substring(1)
+          $m = [regex]::Match((Get-Content project.godot -Raw), '(?m)^config/version="([^"]+)"')
+          if ($m.Groups[1].Value -ne $version) { throw "project.godot ma $($m.Groups[1].Value), a tag mowi $version" }
+          "tag=$tag"         | Out-File $env:GITHUB_OUTPUT -Append
+          "version=$version" | Out-File $env:GITHUB_OUTPUT -Append
+
+      # Godot + szablony eksportu (~1 GB) pobierane raz i trzymane w cache.
+      - uses: actions/cache@v4
+        with:
+          path: .tools
+          key: godot-4.7.2-templates
+
+      - name: Eksport gry
+        shell: pwsh
+        run: |
+          $env:SPOREX_TOOLS = Join-Path $pwd '.tools'
+          ./tools/export.ps1
+
+      - name: Instalator
+        shell: pwsh
+        working-directory: tools/setup
+        run: |
+          cargo test --release --quiet
+          if ($LASTEXITCODE -ne 0) { throw 'testy instalatora' }
+          cargo build --release
+          if ($LASTEXITCODE -ne 0) { throw 'build instalatora' }
+
+      - name: Zasoby i sumy
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item build\SporeX.exe dist\
+          Copy-Item tools\setup\target\release\SporeX-Setup.exe dist\
+          $sums = @('SporeX.exe', 'SporeX-Setup.exe') | ForEach-Object {
+            "{0}  {1}" -f (Get-FileHash "dist\$_" -Algorithm SHA256).Hash.ToLower(), $_
+          }
+          [IO.File]::WriteAllText("$pwd\dist\SHA256SUMS.txt", (($sums -join "`n") + "`n"), [Text.UTF8Encoding]::new($false))
+          Get-Content dist\SHA256SUMS.txt
+
+      - name: Skan Microsoft Defender
+        shell: pwsh
+        run: |
+          $mp = Join-Path $env:ProgramFiles 'Windows Defender\MpCmdRun.exe'
+          if (-not (Test-Path $mp)) { Write-Host '::notice::MpCmdRun.exe nie znaleziony - skan pominiety'; exit 0 }
+          foreach ($a in @('SporeX.exe', 'SporeX-Setup.exe')) {
+            $out = (& $mp -Scan -ScanType 3 -File (Resolve-Path "dist\$a") 2>&1 | Out-String)
+            if ($out -match 'found no threats') { "$a - czysty" }
+            elseif ($out -match 'Threat|found\s+\d|was detected') { Write-Host $out; throw "Defender zglasza $a" }
+            else { Write-Host "::warning::skan $a nie wykonal sie" }
+          }
+
+      - name: GitHub Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = '${{ steps.ver.outputs.tag }}'
+          gh release view $tag *> $null
+          if ($LASTEXITCODE -eq 0) { Write-Host "::notice::wydanie $tag juz istnieje (release.ps1 -Local) - pomijam"; exit 0 }
+          $prev = git tag -l 'v*' --sort=-v:refname | Where-Object { $_ -match '^v\d+\.\d+\.\d+$' -and $_ -ne $tag } | Select-Object -First 1
+          $range = if ($prev) { "$prev..$tag" } else { $tag }
+          $log = git log $range --no-merges --format='- %s'
+          $notes = if ($log) { $log -join "`n" } else { "SporeX ${{ steps.ver.outputs.version }}" }
+          $notes += "`n`nInstalacja: pobierz **SporeX-Setup.exe** i uruchom - pobiera te wersje i instaluje gre dla biezacego uzytkownika (bez administratora). Zainstalowana gra sama pokaze kolejne wydania (F12)."
+          [IO.File]::WriteAllText("$pwd\dist\NOTES.md", $notes, [Text.UTF8Encoding]::new($false))
+          gh release create $tag dist\SporeX.exe dist\SporeX-Setup.exe dist\SHA256SUMS.txt `
+            --title 'SporeX ${{ steps.ver.outputs.version }}' --notes-file dist\NOTES.md --latest
+          if ($LASTEXITCODE -ne 0) { throw 'gh release create nie przeszedl' }
+          $all = gh release list --limit 100 --json tagName,createdAt,isDraft | ConvertFrom-Json
+          $old = $all | Where-Object { -not $_.isDraft } | Sort-Object { [datetime]$_.createdAt } -Descending | Select-Object -Skip 3
+          foreach ($r in $old) { "usuwam wydanie $($r.tagName)"; gh release delete $r.tagName --yes }

@@ -7,6 +7,10 @@ extends Node3D
 ##   --d=1e9         start camera distance in meters
 ##   --shot=out.png  save a screenshot after --frames frames and quit
 ##   --frames=60
+##   --regen=N       press F9 (new random galaxy) at frame N - tests the reset path
+##   --starmult=K    benchmark: draw every galaxy star as K stars (GPU amplification)
+##   --click=x,y --clickframe=N   simulate a left click at frame N
+##   --host or --join=IP   start as LAN host / join a host;  --name=Ala  player name
 
 const STAR_COUNT := 60000
 const DEFAULT_SEED := 20260920
@@ -22,10 +26,12 @@ var system_layer := SystemLayer.new()
 var planet_layer := PlanetLayer.new()
 var surface_layer := SurfaceLayer.new()
 var cell_layer := CellLayer.new()
+var local_stars := LocalStars.new()
 var hud := Hud.new()
 
 var _args := {}
 var _shot_frames := -1
+var _frame := 0
 var _warmup := 3   # frames during which every layer is drawn once so pipelines compile up front
 
 
@@ -33,7 +39,9 @@ func _ready() -> void:
 	_parse_args()
 	var seed: int = int(_args.get("seed", DEFAULT_SEED))
 	NetManager.galaxy_seed = seed
-	NetManager.galaxy_seed_received.connect(_rebuild_universe)
+	NetManager.galaxy_seed_received.connect(_on_seed_received)
+	if _args.has("name"):
+		NetManager.player_name = String(_args["name"])
 
 	# Scene graph
 	env.background_mode = Environment.BG_COLOR
@@ -63,6 +71,8 @@ func _ready() -> void:
 	surface_layer.name = "Surface"
 	cell_layer.name = "Cell"
 	add_child(galaxy_layer)
+	local_stars.name = "Local"
+	add_child(local_stars)
 	add_child(system_layer)
 	add_child(planet_layer)
 	add_child(surface_layer)
@@ -76,10 +86,16 @@ func _ready() -> void:
 	if _args.has("bench"):
 		RenderingServer.viewport_set_measure_render_time(get_viewport().get_viewport_rid(), true)
 
+	galaxy_layer.star_mult = int(_args.get("starmult", 1))
 	_rebuild_universe(seed)
 	universe.time = float(_args.get("time", 0.0))
 	cam.setup(universe, planet_layer.find_water_dir, float(_args.get("d", 1.2e21)))
 	cam.clicked.connect(_on_click)
+	hud.join_requested.connect(func(ip: String): _last_ip = ip; NetManager.join(ip))
+	if _args.has("host"):
+		NetManager.host()
+	elif _args.has("join"):
+		NetManager.join(String(_args["join"]))
 	if not _args.has("yaw"):
 		cam.face_day_side()
 	else:
@@ -96,17 +112,41 @@ func _parse_args() -> void:
 		if a.begins_with("--") and a.contains("="):
 			var kv := a.substr(2).split("=", true, 1)
 			_args[kv[0]] = kv[1]
+		elif a.begins_with("--"):
+			_args[a.substr(2)] = "1"   # bare flag, e.g. --host
 
 
 func _rebuild_universe(seed: int) -> void:
-	universe.build(seed, STAR_COUNT)
-	galaxy_layer.build(universe.galaxy)
+	universe.build(seed, STAR_COUNT, _galaxy_detail())
+	galaxy_layer.build(universe.galaxy, _galaxy_detail())
+	local_stars.setup(universe.galaxy, GraphicsSettings.quality)
 	system_layer.build(universe)
 	planet_layer.set_planet(universe)
 	surface_layer.set_universe(universe)
 	cell_layer.setup(universe, cam)
 	_apply_planet_colors()
 	_prefetch_playable_planets()
+
+
+## Nebula / dust / background density per quality preset. Stars and playable
+## systems do not depend on it, so LAN peers on different presets still share
+## the same universe.
+func _galaxy_detail() -> float:
+	return [0.45, 0.8, 1.0][GraphicsSettings.quality]
+
+
+## Debug (F9): throw away the universe and generate a brand new galaxy with new
+## star systems. From deep zoom the camera returns to the galactic view.
+func _new_galaxy(seed: int) -> void:
+	print("new galaxy, seed ", seed)
+	planet_layer.service.reset()
+	var keep_d := cam.state.d > 1.0e17
+	cam.reset_view(cam.state.d if keep_d else 1.2e21)
+	NetManager.broadcast_seed(seed)
+	_rebuild_universe(seed)
+	if not keep_d:
+		cam.face_day_side()
+	_warmup = 2
 
 
 ## Background-generate terrain for every playable planet so switching targets
@@ -118,7 +158,7 @@ func _prefetch_playable_planets() -> void:
 		if idx == universe.selected_star:
 			continue
 		var c := universe.galaxy.colors[idx]
-		var sys := SystemGenerator.generate(Seeds.mix(universe.galaxy.seed, idx), Color(c.r, c.g, c.b), universe.galaxy.classes[idx])
+		var sys := SystemGenerator.generate(universe.galaxy.system_seed(idx), Color(c.r, c.g, c.b), universe.galaxy.classes[idx])
 		seeds.append(sys.planets[sys.habitable_index].seed)
 	planet_layer.prefetch(seeds)
 
@@ -130,6 +170,13 @@ func _apply_planet_colors() -> void:
 
 func _process(dt: float) -> void:
 	universe.time += dt
+	_frame += 1
+	if _args.has("click") and _frame == int(_args.get("clickframe", 60)):
+		var xy := String(_args["click"]).split(",")
+		_on_click(Vector2(float(xy[0]), float(xy[1])))
+		print("clicked -> star ", universe.selected_star, " ", universe.star_name())
+	if _args.has("regen") and _frame == int(_args["regen"]):
+		_new_galaxy(Seeds.mix(int(_args.get("seed", DEFAULT_SEED)), _frame))
 	if _args.has("select") and _shot_frames == int(_args.get("frames", 60)) - 30:
 		var idx: int = universe.galaxy.habitable[int(_args["select"])]
 		cam.with_smooth_transition(func(): universe.select_star(idx))
@@ -139,6 +186,7 @@ func _process(dt: float) -> void:
 		print("selected star ", idx, " at frame ", _bench_frames)
 	if _args.has("autozoom"):
 		cam._zoom(-float(_args["autozoom"]) * dt)
+	_update_transition(dt)
 	var vs := cam.update(dt)
 	cell_layer.update_control(dt, vs)
 	if vs.cell_mode:
@@ -150,7 +198,11 @@ func _process(dt: float) -> void:
 	var star_fade := 1.0 - atmo * day * 0.97
 	if vs.underwater:
 		star_fade = 0.0
+	star_fade *= _tr_fade
 	galaxy_layer.update_view(vs, universe, star_fade)
+	var anchor_scene := universe.pos_in(Universe.Frame.S, vs.frame).sub(vs.focus).mul(1.0 / vs.u).to_v3()
+	local_stars.update_view(_cam_rel_ly(vs), universe.selected_star, Universe.LY / vs.u, anchor_scene, star_fade, vs.d)
+	hud.extra = "Gwiazdy: w galaktyce ~%.0f mld (wirtualnie), wokół kamery %d tys. w realnej gęstości (na GPU %d tys.), 60 tys. reprezentatywnych" % [local_stars.real_total / 1.0e9, local_stars.generated / 1000, local_stars.drawn / 1000]
 	planet_layer.update_view(vs)
 	system_layer.update_view(vs, planet_layer.visible)
 	surface_layer.update_view(vs)
@@ -164,6 +216,7 @@ func _process(dt: float) -> void:
 	RenderingServer.global_shader_parameter_set("sx_viewport_height", float(get_viewport().get_visible_rect().size.y))
 	_update_light(vs)
 	_update_environment(vs, atmo, day)
+	_update_net(vs)
 	hud.update_info(vs, universe, dt)
 	if _args.has("bench"):
 		_bench_frame(dt, vs)
@@ -234,6 +287,10 @@ func _update_environment(vs: ScaleCamera.ViewState, atmo: float, day: float) -> 
 
 func _on_click(pos: Vector2) -> void:
 	var vs := cam.state
+	if vs.d < 1.0e13:
+		if not vs.locked:
+			_pick_planet(pos, vs)
+		return
 	var best := -1
 	var best_d := 22.0
 	if vs.d > 1.0e16:
@@ -244,22 +301,63 @@ func _on_click(pos: Vector2) -> void:
 			if dist < best_d:
 				best_d = dist
 				best = idx
-		if best >= 0 and best != universe.selected_star:
-			cam.with_smooth_transition(func(): universe.select_star(best))
-			system_layer.build(universe)
-			planet_layer.set_planet(universe)
-			_apply_planet_colors()
-	elif vs.d < 1.0e13 and not vs.locked:
-		for i in universe.system.planets.size():
-			var sp := system_layer.planet_scene_pos(i, vs)
-			var dist := _screen_dist(sp, pos)
-			if dist < best_d:
-				best_d = dist
-				best = i
-		if best >= 0 and best != universe.selected_planet:
-			cam.with_smooth_transition(func(): universe.select_planet(best))
-			planet_layer.set_planet(universe)
-			_apply_planet_colors()
+	if best < 0 and vs.d < 1.0e19:
+		best = _pick_local_star(pos, vs)
+	if best >= 0 and best != universe.selected_star:
+		_select_star(best)
+
+
+func _select_star(idx: int) -> void:
+	cam.with_smooth_transition(func(): universe.select_star(idx))
+	system_layer.build(universe)
+	planet_layer.set_planet(universe)
+	_apply_planet_colors()
+
+
+func _pick_planet(pos: Vector2, vs: ScaleCamera.ViewState) -> void:
+	var best := -1
+	var best_d := 22.0
+	for i in universe.system.planets.size():
+		var sp := system_layer.planet_scene_pos(i, vs)
+		var dist := _screen_dist(sp, pos)
+		if dist < best_d:
+			best_d = dist
+			best = i
+	if best >= 0 and best != universe.selected_planet:
+		cam.with_smooth_transition(func(): universe.select_planet(best))
+		planet_layer.set_planet(universe)
+		_apply_planet_colors()
+
+
+## Any star of the local field can be clicked: it is registered in the galaxy
+## and becomes a star system with its own deterministic seed.
+func _pick_local_star(pos: Vector2, vs: ScaleCamera.ViewState) -> int:
+	var t0 := Time.get_ticks_msec()
+	var cands := local_stars.pickable(_cam_rel_ly(vs), universe.selected_star, camera3d.project_ray_normal(pos))
+	var anchor_scene := universe.pos_in(Universe.Frame.S, vs.frame).sub(vs.focus)
+	var best: Dictionary = {}
+	var best_score := 1.0e9
+	for s in cands:
+		var rel: Vector3 = s["rel"]
+		var sp := DVec3.from_v3(rel).mul(Universe.LY).add(anchor_scene).mul(1.0 / vs.u).to_v3()
+		var dist := _screen_dist(sp, pos)
+		if dist > 16.0:
+			continue
+		var score := dist - 6.0 * LocalStars.brightness(s["lum"], rel.distance_to(_cam_rel_ly(vs)))
+		if score < best_score:
+			best_score = score
+			best = s
+	print("local pick: %d candidates, %d ms" % [cands.size(), Time.get_ticks_msec() - t0])
+	if best.is_empty():
+		return -1
+	var anchor_world := universe.galaxy.positions[universe.selected_star]
+	return universe.galaxy.add_star(anchor_world + best["rel"], best["temp"], best["age"], best["sys_seed"])
+
+
+## Camera position relative to the selected star, in ly (computed in doubles).
+func _cam_rel_ly(vs: ScaleCamera.ViewState) -> Vector3:
+	var cam_m := vs.focus.add(DVec3.from_v3(vs.cam_dir).mul(vs.d)).sub(universe.pos_in(Universe.Frame.S, vs.frame))
+	return cam_m.mul(1.0 / Universe.LY).to_v3()
 
 
 func _screen_dist(scene_pos: Vector3, click: Vector2) -> float:
@@ -269,6 +367,8 @@ func _screen_dist(scene_pos: Vector3, click: Vector2) -> float:
 
 
 func _unhandled_input(event: InputEvent) -> void:
+	if hud.is_typing():
+		return
 	if event is InputEventKey and event.pressed and not event.echo:
 		match event.keycode:
 			KEY_F1:
@@ -280,7 +380,17 @@ func _unhandled_input(event: InputEvent) -> void:
 			KEY_F5:
 				NetManager.host()
 			KEY_F6:
-				NetManager.join_first_host()
+				var ip := ""
+				for h in NetManager.hosts:
+					ip = h
+				hud.show_join(ip if ip != "" else _last_ip)
+			KEY_F7:
+				_goto_first_peer()
+			KEY_F9:
+				if NetManager.mode != "client":
+					_new_galaxy(randi())
+			KEY_F12:
+				Updater.start_update()
 			KEY_F11:
 				var w := get_window()
 				w.mode = Window.MODE_WINDOWED if w.mode == Window.MODE_FULLSCREEN else Window.MODE_FULLSCREEN
@@ -330,3 +440,138 @@ func _force_all_visible() -> void:
 	cell_layer.snow.visible = true
 	galaxy_layer.dust.visible = true
 	galaxy_layer.markers.visible = true
+	galaxy_layer.nebula.visible = true
+	galaxy_layer.core.visible = true
+
+
+# --- multiplayer (LAN) ----------------------------------------------------------
+
+var _tr_state := ""      # "" | "out" (zooming out of our galaxy) | "in" (arriving in the host's)
+var _tr_seed := 0
+var _tr_t := 0.0
+var _tr_fade := 1.0      # galaxy visibility during the hand-over
+var _last_ip := ""
+
+
+## The host told us its galaxy seed (on connect, or after its F9). The camera
+## zooms out to the whole-galaxy view, the galaxy fades, the universe is swapped
+## under the fade and the camera dives into the host's galaxy, straight to the
+## star the host is at - no loading screen, just one continuous zoom.
+func _on_seed_received(seed: int) -> void:
+	_tr_seed = seed
+	_tr_t = 0.0
+	cam.input_enabled = false
+	if universe.galaxy != null and seed == universe.galaxy.seed:
+		_tr_state = "in"
+	else:
+		_tr_state = "out"
+		cam.set_distance(ScaleCamera.D_MAX, false)
+	print("net: galaxy %d from host, transition %s" % [seed, _tr_state])
+
+
+func _update_transition(dt: float) -> void:
+	if _tr_state == "":
+		_tr_fade = minf(_tr_fade + dt * 1.2, 1.0)
+		return
+	_tr_t += dt
+	if _tr_state == "out":
+		var k := clampf((log(cam.state.d) - log(1.0e20)) / (log(ScaleCamera.D_MAX) - log(1.0e20)), 0.0, 1.0)
+		_tr_fade = 1.0 - k
+		if cam.state.d > ScaleCamera.D_MAX * 0.5 or _tr_t > 5.0:
+			planet_layer.service.reset()
+			cam.reset_view(ScaleCamera.D_MAX)
+			_rebuild_universe(_tr_seed)
+			cam.face_day_side()
+			_warmup = 2
+			_tr_state = "in"
+			_tr_t = 0.0
+			_tr_fade = 0.0
+	else:
+		_tr_fade = minf(_tr_fade + dt * 1.2, 1.0)
+		var host := NetManager.host_state()
+		if not host.is_empty() and int(host.get("seed", 0)) == universe.galaxy.seed:
+			_goto_peer_state(host)
+			_end_transition()
+		elif _tr_t > 3.0:
+			cam.set_distance(1.2e21, false)
+			_end_transition()
+
+
+func _end_transition() -> void:
+	_tr_state = ""
+	cam.input_enabled = true
+
+
+## Fly to the star another player is at (and to roughly their scale).
+func _goto_peer_state(state: Dictionary) -> void:
+	var g := universe.galaxy
+	var idx := -1
+	if state.has("vstar"):
+		var v: Dictionary = state["vstar"]
+		idx = g.add_star(v["pos"], float(v["temp"]), float(v["age"]), int(v["sys_seed"]))
+	elif state.has("star_idx"):
+		idx = int(state["star_idx"])
+		if idx < 0 or idx >= g.star_count:
+			idx = -1
+	if idx >= 0 and idx != universe.selected_star:
+		_select_star(idx)
+	cam.set_distance(clampf(float(state.get("d", 1.0e14)), 3.0e13, 1.2e21), false)
+
+
+func _goto_first_peer() -> void:
+	for id in NetManager.peers:
+		var p: Dictionary = NetManager.peers[id]
+		if int(p.get("seed", 0)) == universe.galaxy.seed:
+			_goto_peer_state(p)
+			return
+
+
+## What other players need to know about us: galaxy, star, camera, scale.
+func _local_net_state(vs: ScaleCamera.ViewState) -> Dictionary:
+	var g := universe.galaxy
+	var si := universe.selected_star
+	var s := {
+		"name": NetManager.player_name,
+		"seed": g.seed,
+		"pos": g.positions[si] + _cam_rel_ly(vs),
+		"d": vs.d,
+		"phase": vs.phase,
+		"star_name": universe.star_name(),
+	}
+	if si < g.star_count:
+		s["star_idx"] = si
+	else:
+		s["vstar"] = {"pos": g.positions[si], "temp": g.temps[si], "age": g.ages[si], "sys_seed": g.system_seed(si)}
+	return s
+
+
+func _peer_color(id: int) -> Color:
+	return Color.from_hsv(fmod(float(id % 1000) * 0.618034, 1.0), 0.65, 1.0)
+
+
+func _scene_pos_ly(p: Vector3, vs: ScaleCamera.ViewState) -> Vector3:
+	var rel := p - universe.galaxy.positions[universe.selected_star]
+	var anchor_scene := universe.pos_in(Universe.Frame.S, vs.frame).sub(vs.focus)
+	return DVec3.from_v3(rel).mul(Universe.LY).add(anchor_scene).mul(1.0 / vs.u).to_v3()
+
+
+func _update_net(vs: ScaleCamera.ViewState) -> void:
+	if NetManager.mode == "offline" and NetManager.peers.is_empty():
+		if galaxy_layer.peer_markers and galaxy_layer.peer_markers.multimesh.visible_instance_count > 0:
+			galaxy_layer.set_peers([])
+			hud.set_peer_labels([])
+		return
+	NetManager.local_state = _local_net_state(vs)
+	var marks := []
+	var labels := []
+	for id in NetManager.peers:
+		var p: Dictionary = NetManager.peers[id]
+		if int(p.get("seed", 0)) != universe.galaxy.seed or not p.has("pos"):
+			continue
+		var col := _peer_color(id)
+		marks.append({"pos": p["pos"], "color": col})
+		var sp := _scene_pos_ly(p["pos"], vs)
+		if not camera3d.is_position_behind(sp):
+			labels.append({"p": camera3d.unproject_position(sp), "text": str(p.get("name", "?")), "color": col})
+	galaxy_layer.set_peers(marks)
+	hud.set_peer_labels(labels)
