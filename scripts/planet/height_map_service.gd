@@ -34,6 +34,14 @@ func request(seed: int, front: bool = false) -> void:
 	_sem.post()
 
 
+## Forget everything (new universe): pending jobs and cached maps.
+func reset() -> void:
+	_mutex.lock()
+	_queue.clear()
+	_mutex.unlock()
+	cache.clear()
+
+
 func best(seed: int) -> PlanetGenerator.HeightMapResult:
 	return cache.get(seed)
 

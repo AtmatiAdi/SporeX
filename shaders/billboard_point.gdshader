@@ -6,7 +6,8 @@ render_mode unshaded, blend_add, depth_draw_never, cull_disabled, skip_vertex_tr
 // is a single draw call and the CPU never touches it after generation.
 //
 // INSTANCE_CUSTOM: x = world radius (local units, 0 = point), y = min size in
-// pixels, z = shape (0 soft dot, 1 ring, 2 glow), w = unused.
+// pixels, z = shape (0 soft dot, 1 ring, 2 glow, 3 star with diffraction
+// spikes), w = unused.
 // COLOR.a = brightness.
 
 uniform bool manual_transform = false; // galaxy mode: apply anchor/scale/offset here (keeps node transform identity)
@@ -21,6 +22,24 @@ global uniform float sx_viewport_height;
 uniform bool wrap_enabled = false;     // marine snow: wrap around the origin
 uniform float wrap_size = 1.0;
 uniform vec3 drift = vec3(0.0);
+// Amplification: meshes with K quads per instance (UV2.x = quad index) turn
+// every star into K stars; children are scattered by a hash on the GPU, so
+// K x more stars cost no memory and no CPU. Quad 0 is the parent.
+uniform float sub_spread = 0.0;        // local units
+uniform vec3 sub_normal = vec3(0.0, 1.0, 0.0);
+
+uint sx_h(uint x) {
+	x ^= x >> 16u;
+	x *= 2146121005u;
+	x ^= x >> 15u;
+	x *= 2221713035u;
+	x ^= x >> 16u;
+	return x;
+}
+
+float sx_u(uint h) {
+	return float(h >> 8u) * (1.0 / 16777216.0);
+}
 
 varying vec2 v_uv;
 varying vec4 v_col;
@@ -28,9 +47,18 @@ varying float v_shape;
 
 void vertex() {
 	vec3 center;
+	float sub_dim = 1.0;
 	float scale;
 	if (manual_transform) {
-		center = (MODEL_MATRIX[3].xyz - anchor) * unit_scale + offset;
+		vec3 origin = MODEL_MATRIX[3].xyz;
+		if (UV2.x > 0.5) {
+			uint h = sx_h(uint(INSTANCE_ID) * 7919u + uint(UV2.x));
+			vec3 g = vec3(sx_u(h), sx_u(sx_h(h + 1u)), sx_u(sx_h(h + 2u))) * 2.0 - 1.0;
+			g -= sub_normal * dot(g, sub_normal) * 0.75;   // stay in the disk
+			origin += g * sub_spread;
+			sub_dim = 0.2 + 0.5 * sx_u(sx_h(h + 3u));
+		}
+		center = (origin - anchor) * unit_scale + offset;
 		scale = unit_scale;
 	} else {
 		center = MODEL_MATRIX[3].xyz;
@@ -56,6 +84,10 @@ void vertex() {
 	NORMAL = vec3(0.0, 0.0, 1.0);
 	v_uv = UV * 2.0 - 1.0;
 	v_col = COLOR;
+	if (sub_dim < 1.0) {
+		// Children: dimmer and redder (most stars are dwarfs).
+		v_col = vec4(mix(COLOR.rgb, vec3(1.0, 0.72, 0.5), 1.0 - sub_dim), COLOR.a * sub_dim);
+	}
 	v_shape = INSTANCE_CUSTOM.z;
 }
 
@@ -66,6 +98,12 @@ void fragment() {
 		a = pow(max(0.0, 1.0 - r), 2.0);
 	} else if (v_shape < 1.5) {
 		a = 1.0 - smoothstep(0.0, 0.14, abs(r - 0.78));
+	} else if (v_shape > 2.5) {
+		// Bright star: tight core + faint 4-point diffraction spikes.
+		vec2 q = abs(v_uv);
+		float core = pow(max(0.0, 1.0 - r * 2.2), 2.0);
+		float spikes = max(0.0, 1.0 - q.x * 18.0) * pow(1.0 - q.y, 2.0) + max(0.0, 1.0 - q.y * 18.0) * pow(1.0 - q.x, 2.0);
+		a = core + spikes * 0.35 + exp(-r * r * 9.0) * 0.12;
 	} else {
 		float core = exp(-r * r * 14.0);
 		float halo = pow(max(0.0, 1.0 - r), 1.6) * 0.35;

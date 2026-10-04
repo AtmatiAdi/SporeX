@@ -88,6 +88,18 @@ func set_distance(d: float, immediate: bool = true) -> void:
 		log_d = log_d_target
 
 
+## Drop every transient state (lock, fly-over, cell) and jump to distance d.
+## Used when the whole universe is replaced (debug: new galaxy).
+func reset_view(d: float) -> void:
+	locked = false
+	trans_offset = DVec3.zero()
+	roll_extra = 0.0
+	cell_pos = DVec3.zero()
+	cell_vel = DVec3.zero()
+	pitch = clampf(pitch, -89.0, 89.0)
+	set_distance(d, true)
+
+
 ## 0 when d >= hi, 1 when d <= lo, smooth in log space in between.
 static func blend(d: float, hi: float, lo: float) -> float:
 	var t := (log(hi) - log(d)) / (log(hi) - log(lo))

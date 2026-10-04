@@ -21,8 +21,12 @@ var lock_dir_body := Vector3.UP
 var l_basis_body := Basis.IDENTITY
 
 
-func build(seed: int, star_count: int) -> void:
-	galaxy = GalaxyGenerator.generate(seed, star_count)
+func build(seed: int, star_count: int, detail: float = 1.0) -> void:
+	var t0 := Time.get_ticks_msec()
+	galaxy = GalaxyGenerator.generate(seed, star_count, detail)
+	print("galaxy %d (%s, %d stars, %d nebula, %d dust, %d far): %d ms" % [seed, galaxy.morph_name, galaxy.star_count,
+		galaxy.nebula.size(), galaxy.dust.size(), galaxy.far.size(), Time.get_ticks_msec() - t0])
+	selected_star = -1
 	select_star(galaxy.habitable[0])
 
 
@@ -31,7 +35,7 @@ func select_star(index: int) -> void:
 		return
 	selected_star = index
 	var c := galaxy.colors[index]
-	system = SystemGenerator.generate(Seeds.mix(galaxy.seed, index), Color(c.r, c.g, c.b), galaxy.classes[index])
+	system = SystemGenerator.generate(galaxy.system_seed(index), Color(c.r, c.g, c.b), galaxy.classes[index])
 	selected_planet = system.habitable_index
 
 
