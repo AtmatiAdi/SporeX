@@ -104,7 +104,7 @@ function Set-Version {
     [IO.File]::WriteAllText($presetFile, $preset, [Text.UTF8Encoding]::new($false))
     $cargoFile = Join-Path $root 'tools\setup\Cargo.toml'
     $cargo = Get-Content $cargoFile -Raw
-    $cargo = [regex]::Replace($cargo, '(?m)^version = "[^"]*"', "version = `"$Version`"", 1)
+    $cargo = ([regex]'(?m)^version = "[^"]*"').Replace($cargo, "version = `"$Version`"", 1)   # tylko pierwsze (pakiet), nie zaleznosci
     [IO.File]::WriteAllText($cargoFile, $cargo, [Text.UTF8Encoding]::new($false))
 }
 
