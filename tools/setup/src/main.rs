@@ -10,6 +10,7 @@
 //!   --uninstall     odinstaluj (wpis w "Zainstalowane aplikacje")
 //!   --no-launch     nie uruchamiaj gry po instalacji
 //!   --repo o/r      inne repozytorium wydan niz wbudowane
+//!   --download-only <dir>  tylko pobierz i sprawdz sumy do <dir> (test, CI)
 
 #![windows_subsystem = "windows"]
 
@@ -70,6 +71,7 @@ struct Options {
     wait_pid: Option<u32>,
     launch: bool,
     update: bool,
+    download_only: Option<std::path::PathBuf>,
 }
 
 fn main() -> Result<()> {
@@ -91,6 +93,7 @@ fn main() -> Result<()> {
         wait_pid: arg_value(&args, "--wait").and_then(|s| s.parse().ok()),
         launch: !args.iter().any(|a| a == "--no-launch"),
         update: args.iter().any(|a| a == "--update"),
+        download_only: arg_value(&args, "--download-only").map(std::path::PathBuf::from),
     };
     let hwnd = create_window(if opts.update { "SporeX – aktualizacja" } else { "SporeX – instalacja" })?;
     let shared = Arc::new(Mutex::new(Shared { text: "Sprawdzam najnowsze wydanie...".into(), pos: None }));
@@ -105,7 +108,7 @@ fn main() -> Result<()> {
     });
     unsafe {
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(setup) as isize);
-        let _ = ShowWindow(hwnd, SW_SHOW);
+        let _ = ShowWindow(hwnd, if opts.download_only.is_some() { SW_SHOWNOACTIVATE } else { SW_SHOW });
     }
     let hwnd_raw = hwnd.0 as isize;
     std::thread::spawn(move || {
@@ -214,7 +217,7 @@ fn run(opts: &Options, shared: &Arc<Mutex<Shared>>, cancel: &Arc<AtomicBool>, hw
     let version = tag.trim_start_matches('v').to_string();
     let base = format!("https://github.com/{}/releases/download/{tag}", opts.repo);
 
-    let dir = install::download_dir();
+    let dir = opts.download_only.clone().unwrap_or_else(install::download_dir);
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     let sums_path = dir.join(SUMS);
     http::download(&format!("{base}/{SUMS}"), &[ua], &sums_path, &mut |_, _| true)
@@ -255,6 +258,9 @@ fn run(opts: &Options, shared: &Arc<Mutex<Shared>>, cancel: &Arc<AtomicBool>, hw
     let game = fetch(install::GAME_EXE, true)?;
     let setup = fetch(install::SETUP_EXE, false).ok();
 
+    if opts.download_only.is_some() {
+        return Ok(version);
+    }
     set("Instaluję...".into(), Some(1000));
     let about = format!("https://github.com/{}", opts.repo);
     let exe = install::install(&game, setup.as_deref(), &version, &about).map_err(|e| e.to_string())?;
